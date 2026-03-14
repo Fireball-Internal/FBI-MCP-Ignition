@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "fbi_ignition_mcp",
+  "project_id": "7a66609e-6178-4af8-bdf1-d8561185100d"
+}
