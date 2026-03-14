@@ -1,0 +1,64 @@
+{
+  "manifest_version": "0.3",
+  "name": "caldera-mcp",
+  "display_name": "Caldera MCP",
+  "version": "0.5.1",
+  "description": "Connect Claude to your Ignition SCADA gateway via the Caldera MCP server. Provides 71+ tools for Perspective views, scripts, tags, named queries, screenshots, and gateway management.",
+  "long_description": "Caldera MCP provides Claude with tools for managing Inductive Automation's Ignition platform, including Perspective view CRUD, Jython script execution, tag browsing, named query execution, view screenshots, project snapshots, and gateway backups. Requires the Caldera MCP server running on your Ignition gateway.",
+  "author": {
+    "name": "Jaeden Colaiacovo",
+    "url": "https://github.com/jaedync"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaedync/caldera-mcp"
+  },
+  "homepage": "https://github.com/jaedync/caldera-mcp",
+  "documentation": "https://github.com/jaedync/caldera-mcp",
+  "support": "https://github.com/jaedync/caldera-mcp/issues",
+  "server": {
+    "type": "node",
+    "entry_point": "node_modules/mcp-remote/dist/proxy.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/node_modules/mcp-remote/dist/proxy.js",
+        "${user_config.server_url}"
+      ],
+      "env": {}
+    }
+  },
+  "tools_generated": true,
+  "tools": [
+    { "name": "get_gateway_health", "description": "Gateway health check and status" },
+    { "name": "get_connection_status", "description": "MCP-to-Ignition connectivity" },
+    { "name": "read_view", "description": "Read a Perspective view" },
+    { "name": "write_view", "description": "Write/update a Perspective view" },
+    { "name": "read_component", "description": "Read a component from a view" },
+    { "name": "execute_script", "description": "Execute Jython on the gateway" },
+    { "name": "browse_tags", "description": "Browse the tag tree" },
+    { "name": "read_tags", "description": "Read tag values" },
+    { "name": "write_tags", "description": "Write tag values" },
+    { "name": "run_named_query", "description": "Execute a named query" },
+    { "name": "screenshot_view", "description": "Screenshot a Perspective view" },
+    { "name": "snapshot_project", "description": "Snapshot a project for backup" }
+  ],
+  "keywords": ["ignition", "scada", "mes", "inductive-automation", "perspective", "gateway", "hmi"],
+  "license": "MIT",
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "Caldera MCP Server URL",
+      "description": "URL of your Caldera MCP server endpoint (default: http://localhost:8765/mcp)",
+      "default": "http://localhost:8765/mcp",
+      "required": true
+    }
+  }
+}

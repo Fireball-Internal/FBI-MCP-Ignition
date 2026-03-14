@@ -1,0 +1,1908 @@
+#!/usr/bin/env python3
+"""
+Ignition Perspective Component Linter
+
+A robust linting tool for Ignition Perspective view.json files that validates:
+- Component structure against empirical schema
+- Property usage patterns
+- Best practices compliance
+- Performance considerations
+
+Usage:
+    uv run python ignition-perspective-linter.py --target /path/to/ignition/project
+    uv run python ignition-perspective-linter.py --target /path/to/ignition/project --verbose
+    uv run python ignition-perspective-linter.py --target /path/to/ignition/project --component-type ia.display.label
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    from jsonschema import ValidationError, validate
+
+    JSONSCHEMA_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    validate = None  # type: ignore[var-annotated]
+    JSONSCHEMA_AVAILABLE = False
+
+    class ValidationError(Exception):
+        """Fallback error when jsonschema is unavailable."""
+
+        pass
+
+
+from ..reporting import LintIssue, LintSeverity
+from ..schemas import schema_path_for as _schema_path_for
+from ..validators.expression import ExpressionValidator
+from ..validators.jython import JythonValidator
+
+
+class IgnitionPerspectiveLinter:
+    def __init__(self, schema_path: str = None):
+        """Initialize the linter with the component schema."""
+        if schema_path is None:
+            schema_path = _schema_path_for("robust")
+        else:
+            schema_path = Path(schema_path)
+
+        self.schema_path = schema_path
+        self.jsonschema_available = JSONSCHEMA_AVAILABLE and validate is not None
+        self.schema = self._load_schema(schema_path)
+        self.issues: list[LintIssue] = []
+        self.component_stats = {
+            "total_files": 0,
+            "total_components": 0,
+            "valid_components": 0,
+            "invalid_components": 0,
+            "component_types": set(),
+        }
+        self._missing_schema_files: set[str] = set()
+        self.jython_validator = JythonValidator()
+        self.expression_validator = ExpressionValidator()
+        self.known_prop_names = self._extract_known_props()
+        self._component_props = self._load_component_props()
+
+        # Known best practices patterns
+        self.best_practices = {
+            "preferred_containers": ["ia.container.flex"],
+            "deprecated_patterns": [],
+            "required_meta_properties": ["name"],
+            "performance_concerns": {
+                "ia.display.flex-repeater": "Consider performance impact with large datasets",
+                "ia.display.table": "Large tables may impact rendering performance",
+                "ia.chart.xy": "Complex charts with many data points may be slow",
+            },
+        }
+
+    def _load_schema(self, schema_path: str) -> dict:
+        """Load the JSON schema for validation."""
+        try:
+            with open(schema_path) as f:
+                return json.load(f)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Schema file not found: {schema_path}") from e
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in schema file: {schema_path}: {e}") from e
+
+    def _extract_known_props(self) -> frozenset:
+        """Extract known property names from the loaded component schema.
+
+        Recursively walks the schema to collect property names from:
+        - Top-level properties
+        - definitions/components
+        - oneOf/anyOf/allOf branches
+        - additionalProperties pattern objects
+
+        Falls back to a minimal set if the schema could not be parsed.
+        """
+        props: set[str] = set()
+
+        def walk_schema(schema_node):
+            """Recursively collect property names from a schema node."""
+            if not isinstance(schema_node, dict):
+                return
+
+            # Collect from properties
+            if "properties" in schema_node:
+                schema_props = schema_node.get("properties", {})
+                if isinstance(schema_props, dict):
+                    props.update(schema_props.keys())
+
+            # Walk definitions
+            if "definitions" in schema_node:
+                definitions = schema_node.get("definitions", {})
+                if isinstance(definitions, dict):
+                    for defn in definitions.values():
+                        walk_schema(defn)
+
+            # Walk oneOf/anyOf/allOf branches
+            for key in ("oneOf", "anyOf", "allOf"):
+                if key in schema_node:
+                    branches = schema_node.get(key, [])
+                    if isinstance(branches, list):
+                        for branch in branches:
+                            walk_schema(branch)
+
+            # Walk additionalProperties if it's a schema object
+            if "additionalProperties" in schema_node:
+                additional = schema_node.get("additionalProperties")
+                if isinstance(additional, dict):
+                    walk_schema(additional)
+
+        try:
+            # Start from top-level props.properties
+            schema_props = (
+                self.schema.get("properties", {}).get("props", {}).get("properties", {})
+            )
+            props.update(schema_props.keys())
+
+            # Also walk the entire schema for definitions
+            walk_schema(self.schema)
+
+            # Add supplementary allowlist for common cross-component properties
+            supplementary = {"fit", "tagPath", "viewPath", "source", "alt", "path"}
+            props.update(supplementary)
+
+        except (AttributeError, TypeError):
+            pass
+
+        if not props:
+            # Minimal fallback when schema is unavailable
+            props = {"style", "text", "value", "enabled", "visible"}
+
+        return frozenset(props)
+
+    @staticmethod
+    def _load_component_props() -> dict[str, frozenset[str]]:
+        """Load per-component property map from component-props.json."""
+        comp_props_path = (
+            Path(__file__).parent.parent / "schemas" / "component-props.json"
+        )
+        try:
+            with open(comp_props_path) as f:
+                raw = json.load(f)
+            return {k: frozenset(v) for k, v in raw.items()}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _get_known_props_for_type(self, comp_type: str) -> frozenset[str]:
+        """Return known properties for a specific component type.
+
+        Merges component-specific props with generic schema props.
+        Falls back to generic-only for unknown component types.
+        """
+        type_specific = self._component_props.get(comp_type, frozenset())
+        return self.known_prop_names | type_specific
+
+    def find_view_files(self, target_path: str) -> list[str]:
+        """Find all view.json files in the target directory."""
+        view_files = []
+        target = Path(target_path)
+
+        if not target.exists():
+            print(f"ERROR: Target path does not exist: {target_path}", file=sys.stderr)
+            return []
+
+        # Look for perspective views structure
+        perspective_path = target / "com.inductiveautomation.perspective" / "views"
+        if perspective_path.exists():
+            search_path = perspective_path
+        else:
+            search_path = target
+
+        for root, _dirs, files in os.walk(search_path):
+            for file in files:
+                if file == "view.json":
+                    view_files.append(os.path.join(root, file))
+
+        return view_files
+
+    def extract_components_with_context(
+        self, view_data: dict, file_path: str
+    ) -> list[tuple[dict, str, str]]:
+        """Extract all ia.* components with their context path."""
+        components = []
+
+        def extract_recursive(obj, path="root"):
+            if isinstance(obj, dict):
+                if (
+                    "type" in obj
+                    and isinstance(obj["type"], str)
+                    and obj["type"].startswith("ia.")
+                ):
+                    components.append((obj, file_path, path))
+
+                if "children" in obj and isinstance(obj["children"], list):
+                    for i, child in enumerate(obj["children"]):
+                        extract_recursive(child, f"{path}.children[{i}]")
+
+                if "root" in obj:
+                    extract_recursive(obj["root"], f"{path}.root")
+
+        extract_recursive(view_data)
+        return components
+
+    def validate_component_schema(
+        self, component: dict, file_path: str, component_path: str
+    ) -> bool:
+        """Validate a component against the schema."""
+        if not self.jsonschema_available or validate is None:
+            if file_path not in self._missing_schema_files:
+                self._missing_schema_files.add(file_path)
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code="SCHEMA_VALIDATION_SKIPPED",
+                        message="Schema validation skipped because the 'jsonschema' package is not available.",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=component.get("type", "unknown"),
+                        suggestion="Install the 'jsonschema' package to enable schema validation.",
+                    )
+                )
+            return True
+
+        try:
+            validate(instance=component, schema=self.schema)
+            return True
+        except ValidationError as e:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="SCHEMA_VALIDATION",
+                    message=f"Schema validation failed: {e.message}",
+                    file_path=file_path,
+                    component_path=component_path,
+                    component_type=component.get("type", "unknown"),
+                    suggestion=f"Path: {'.'.join(map(str, e.absolute_path))}"
+                    if e.absolute_path
+                    else None,
+                )
+            )
+            return False
+
+    def check_component_best_practices(
+        self, component: dict, file_path: str, component_path: str
+    ):
+        """Check component against best practices."""
+        comp_type = component.get("type", "")
+
+        # Check for unknown props
+        props = component.get("props", {})
+        known_for_type = self._get_known_props_for_type(comp_type)
+        if isinstance(props, dict):
+            for prop_name in props:
+                if prop_name not in known_for_type:
+                    self.issues.append(
+                        LintIssue(
+                            severity=LintSeverity.STYLE,
+                            code="UNKNOWN_PROP",
+                            message=f"Unknown property '{prop_name}' in component",
+                            file_path=file_path,
+                            component_path=component_path,
+                            component_type=comp_type,
+                            suggestion=f"Verify '{prop_name}' is a valid Ignition component property",
+                        )
+                    )
+
+        # Check for required meta properties
+        meta = component.get("meta", {})
+        for required_prop in self.best_practices["required_meta_properties"]:
+            if required_prop not in meta:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code="MISSING_META_PROPERTY",
+                        message=f"Missing required meta property: '{required_prop}'",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion=f"Add 'meta.{required_prop}' property",
+                    )
+                )
+
+        # Check for empty or generic names
+        name = meta.get("name", "")
+        if not name:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.WARNING,
+                    code="EMPTY_COMPONENT_NAME",
+                    message="Component has empty or missing name",
+                    file_path=file_path,
+                    component_path=component_path,
+                    component_type=comp_type,
+                    suggestion="Provide a descriptive name for debugging and maintenance",
+                )
+            )
+        elif name in ["Component", "View", "Container", "Label", "Button"]:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.STYLE,
+                    code="GENERIC_COMPONENT_NAME",
+                    message=f"Generic component name '{name}' should be more descriptive",
+                    file_path=file_path,
+                    component_path=component_path,
+                    component_type=comp_type,
+                    suggestion="Use descriptive names like 'StatusLabel', 'SubmitButton', etc.",
+                )
+            )
+
+        # Check for performance concerns
+        if comp_type in self.best_practices["performance_concerns"]:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.INFO,
+                    code="PERFORMANCE_CONSIDERATION",
+                    message=self.best_practices["performance_concerns"][comp_type],
+                    file_path=file_path,
+                    component_path=component_path,
+                    component_type=comp_type,
+                )
+            )
+
+        # Check for missing position properties in containers
+        if comp_type.startswith("ia.container.") and "children" in component:
+            children = component.get("children", [])
+            for i, child in enumerate(children):
+                # Position can be static (position object) or dynamic (propConfig.position.*)
+                has_static_position = "position" in child
+                child_prop_config = child.get("propConfig", {})
+                has_bound_position = any(
+                    key.startswith("position.") for key in child_prop_config.keys()
+                )
+
+                if not has_static_position and not has_bound_position:
+                    self.issues.append(
+                        LintIssue(
+                            severity=LintSeverity.WARNING,
+                            code="MISSING_CHILD_POSITION",
+                            message=f"Child component at index {i} missing position properties",
+                            file_path=file_path,
+                            component_path=f"{component_path}.children[{i}]",
+                            component_type=child.get("type", "unknown"),
+                            suggestion="Add position properties or bind them via propConfig.position.*",
+                        )
+                    )
+
+        # Check for inefficient flex container usage
+        if comp_type == "ia.container.flex":
+            props = component.get("props", {})
+            children = component.get("children", [])
+
+            # Single child in flex container might be unnecessary
+            if len(children) == 1:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.STYLE,
+                        code="SINGLE_CHILD_FLEX",
+                        message="Flex container with single child may be unnecessary",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion="Consider if flex container is needed for single child",
+                    )
+                )
+
+            # Check for missing direction property
+            # Direction can be static (props.direction) or dynamic (propConfig.props.direction)
+            prop_config = component.get("propConfig", {})
+            has_static_direction = "direction" in props
+            has_bound_direction = "props.direction" in prop_config
+
+            if (
+                not has_static_direction
+                and not has_bound_direction
+                and len(children) > 1
+            ):
+                comp_name = component.get("meta", {}).get("name", "")
+                metadata = {
+                    "search_key": '"justify"' if "justify" in props else '"props"'
+                }
+                if comp_name:
+                    metadata["component_name"] = comp_name
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.INFO,
+                        code="MISSING_FLEX_DIRECTION",
+                        message="Flex container missing explicit direction property",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion="Add 'props.direction' or bind it via 'propConfig.props.direction'",
+                    )
+                )
+
+        # Validate bindings
+        self._validate_bindings(component, file_path, component_path)
+
+        # Validate event handler Jython scripts
+        self._validate_event_scripts(component, file_path, component_path)
+
+        # Validate onChange scripts in propConfig
+        self._validate_onchange_scripts(component, file_path, component_path)
+
+        # Validate expression bindings and transforms
+        self._validate_expressions(component, file_path, component_path)
+
+        # Check for missing text in labels
+        if comp_type == "ia.display.label":
+            props = component.get("props", {})
+            prop_config = component.get("propConfig", {})
+
+            # Check if text is provided either directly or via binding
+            has_text = "text" in props
+            has_text_binding = "props.text" in prop_config
+
+            if not has_text and not has_text_binding:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code="MISSING_LABEL_TEXT",
+                        message="Label component missing text content or binding",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion="Add 'props.text' or 'propConfig.props.text.binding'",
+                    )
+                )
+
+        # Check for missing path in icons
+        if comp_type == "ia.display.icon":
+            props = component.get("props", {})
+            prop_config = component.get("propConfig", {})
+            # Path can be static (props.path) or dynamic (propConfig.props.path.binding)
+            has_static_path = "path" in props
+            has_bound_path = "props.path" in prop_config
+
+            if not has_static_path and not has_bound_path:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.ERROR,
+                        code="MISSING_ICON_PATH",
+                        message="Icon component missing required path property",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion="Add 'props.path' with icon reference or bind it via 'propConfig.props.path'",
+                    )
+                )
+
+    def check_component_accessibility(
+        self, component: dict, file_path: str, component_path: str
+    ):
+        """Check component for accessibility best practices."""
+        comp_type = component.get("type", "")
+
+        # Check for interactive components without proper labeling
+        interactive_types = [
+            "ia.input.button",
+            "ia.input.dropdown",
+            "ia.input.text-field",
+            "ia.input.checkbox",
+            "ia.input.toggle-switch",
+        ]
+
+        if comp_type in interactive_types:
+            props = component.get("props", {})
+            meta = component.get("meta", {})
+
+            # Check for descriptive text or aria labels
+            has_text = "text" in props
+            has_placeholder = "placeholder" in props
+            has_name = "name" in meta and meta["name"] not in [
+                "Component",
+                "Button",
+                "Input",
+            ]
+
+            if not (has_text or has_placeholder or has_name):
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.INFO,
+                        code="ACCESSIBILITY_LABELING",
+                        message="Interactive component may need better labeling for accessibility",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion="Add descriptive text, placeholder, or meaningful name",
+                    )
+                )
+
+    # Valid binding scopes in Perspective — only these prefixes may appear
+    # as propConfig keys.  Structural keys like ``children``, ``type``, and
+    # ``meta.name`` have no binding scope and must never be targeted.
+    _VALID_BINDING_SCOPES = ("props.", "position.", "custom.", "meta.", "params.")
+
+    def _validate_bindings(self, component: dict, file_path: str, component_path: str):
+        """Validate bindings based on empirical analysis patterns."""
+        prop_config = component.get("propConfig", {})
+        comp_type = component.get("type", "unknown")
+
+        # Check for non-bindable structural properties in propConfig
+        for prop_name in prop_config:
+            if not prop_name.startswith(self._VALID_BINDING_SCOPES):
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.ERROR,
+                        code="BINDING_NON_BINDABLE_PROPERTY",
+                        message=f"propConfig targets non-bindable structural property '{prop_name}'",
+                        file_path=file_path,
+                        component_path=f"{component_path}.propConfig.{prop_name}",
+                        component_type=comp_type,
+                        suggestion=(
+                            f"'{prop_name}' is a structural key with no binding scope. "
+                            "Only props.*, position.*, custom.*, meta.*, and params.* "
+                            "are bindable. This will cause an IllegalArgumentException "
+                            "in Ignition Designer."
+                        ),
+                    )
+                )
+
+        # Validate each property binding
+        for prop_name, config in prop_config.items():
+            if "binding" not in config:
+                continue
+
+            binding = config["binding"]
+            binding_type = binding.get("type")
+            binding_config = binding.get("config", {})
+            transforms = binding.get("transforms", [])
+
+            # Validate binding type
+            valid_binding_types = [
+                "property",
+                "expr",
+                "tag",
+                "expr-struct",
+                "query",
+                "tag-history",
+            ]
+            if binding_type not in valid_binding_types:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.ERROR,
+                        code="INVALID_BINDING_TYPE",
+                        message=f"Invalid binding type '{binding_type}' for {prop_name}",
+                        file_path=file_path,
+                        component_path=f"{component_path}.propConfig.{prop_name}",
+                        component_type=comp_type,
+                        suggestion=f"Use one of: {', '.join(valid_binding_types)}",
+                    )
+                )
+
+            # Validate type-specific configurations
+            if binding_type == "tag":
+                self._validate_tag_binding(
+                    binding_config, prop_name, file_path, component_path, comp_type
+                )
+            elif binding_type == "expr":
+                self._validate_expr_binding(
+                    binding_config, prop_name, file_path, component_path, comp_type
+                )
+            elif binding_type == "property":
+                self._validate_property_binding(
+                    binding_config, prop_name, file_path, component_path, comp_type
+                )
+
+            # Validate transforms
+            for i, transform in enumerate(transforms):
+                self._validate_transform(
+                    transform, prop_name, i, file_path, component_path, comp_type
+                )
+
+    def _validate_tag_binding(
+        self,
+        config: dict,
+        prop_name: str,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Validate tag binding configuration."""
+        if "tagPath" not in config:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="MISSING_TAG_PATH",
+                    message=f"Tag binding for {prop_name} missing required 'tagPath'",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion="Add 'tagPath' property to tag binding config",
+                )
+            )
+
+        # Check for fallback handling on critical properties
+        if prop_name in ["props.text", "props.value"] and "fallbackDelay" not in config:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.INFO,
+                    code="MISSING_TAG_FALLBACK",
+                    message=f"Tag binding for {prop_name} should include fallback handling",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion="Consider adding 'fallbackDelay' for better error handling",
+                )
+            )
+
+    def _validate_expr_binding(
+        self,
+        config: dict,
+        prop_name: str,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Validate expression binding configuration."""
+        if "expression" not in config:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="MISSING_EXPRESSION",
+                    message=f"Expression binding for {prop_name} missing required 'expression'",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion="Add 'expression' property to expression binding config",
+                )
+            )
+
+    def _validate_property_binding(
+        self,
+        config: dict,
+        prop_name: str,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Validate property binding configuration."""
+        if "path" not in config:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="MISSING_PROPERTY_PATH",
+                    message=f"Property binding for {prop_name} missing required 'path'",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion="Add 'path' property to property binding config",
+                )
+            )
+            return
+
+        path = config["path"]
+        if not isinstance(path, str) or not path.strip():
+            return
+
+        # /root.custom.X or /root.params.X is a common mistake — should be view.custom.X
+        # or view.params.X.  Valid absolute component refs use slashes: /root/Child.props.X
+        if path.startswith("/root."):
+            suffix = path[len("/root.") :]
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="BINDING_ROOT_DOT_PATH",
+                    message=f"Property binding path '{path}' uses /root. prefix which resolves to Bad_NotFound",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion=(
+                        f"Change the Property binding path to 'view.{suffix}'. "
+                        f'In the binding config JSON set "path": "view.{suffix}"'
+                    ),
+                )
+            )
+            return
+
+        # Bare root.custom.X or root.params.X without leading / or view. scope
+        if path.startswith("root.custom.") or path.startswith("root.params."):
+            suffix = path[len("root.") :]
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="BINDING_BARE_ROOT_PATH",
+                    message=f"Property binding path '{path}' uses bare root. prefix which is not a valid scope",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion=(
+                        f"Change to 'view.{suffix}' for view properties "
+                        f"or '/root/...' for component references"
+                    ),
+                )
+            )
+            return
+
+        # Valid scope prefixes — pass through without further syntax checks
+        _VALID_SCOPE_PREFIXES = (
+            "view.",
+            "this.",
+            "session.",
+            "page.",
+            "parent.",
+        )
+        # Valid structural prefixes — absolute and relative component refs
+        _VALID_STRUCTURAL_PREFIXES = (
+            "/root/",
+            "/root.",
+            "./",
+        )
+
+        if any(path.startswith(p) for p in _VALID_SCOPE_PREFIXES):
+            return
+        if any(path.startswith(p) for p in _VALID_STRUCTURAL_PREFIXES):
+            return
+        # Multi-dot relative paths: ../ (1 up), .../ (2 up), ..../ (3 up), etc.
+        if re.match(r"\.{2,}/", path):
+            return
+
+        # If path contains dots but no recognized scope, flag it
+        if "." in path:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="BINDING_INVALID_SCOPE",
+                    message=f"Property binding path '{path}' has no recognized scope prefix",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}",
+                    component_type=comp_type,
+                    suggestion=(
+                        "Valid scopes: view, this, session, page, parent. "
+                        "For component refs use /root/... or ./"
+                    ),
+                )
+            )
+
+    def _validate_transform(
+        self,
+        transform: dict,
+        prop_name: str,
+        index: int,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Validate transform configuration."""
+        transform_type = transform.get("type")
+        valid_transform_types = ["map", "script", "expression", "format"]
+
+        if transform_type not in valid_transform_types:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="INVALID_TRANSFORM_TYPE",
+                    message=f"Invalid transform type '{transform_type}' for {prop_name}",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}.transforms[{index}]",
+                    component_type=comp_type,
+                    suggestion=f"Use one of: {', '.join(valid_transform_types)}",
+                )
+            )
+
+        # Validate type-specific requirements
+        if transform_type == "script":
+            if "code" not in transform:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.ERROR,
+                        code="MISSING_SCRIPT_CODE",
+                        message=f"Script transform for {prop_name} missing 'code' property",
+                        file_path=file_path,
+                        component_path=f"{component_path}.propConfig.{prop_name}.transforms[{index}]",
+                        component_type=comp_type,
+                        suggestion="Add 'code' property with Jython script",
+                    )
+                )
+            else:
+                # Validate the Jython script content
+                script_code = transform["code"]
+                context = f"transform[{index}]"
+                self._validate_jython_script(
+                    script_code,
+                    prop_name,
+                    context,
+                    file_path,
+                    component_path,
+                    comp_type,
+                )
+
+        if transform_type == "expression" and "expression" not in transform:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="MISSING_TRANSFORM_EXPRESSION",
+                    message=f"Expression transform for {prop_name} missing 'expression' property",
+                    file_path=file_path,
+                    component_path=f"{component_path}.propConfig.{prop_name}.transforms[{index}]",
+                    component_type=comp_type,
+                    suggestion="Add 'expression' property with transform expression",
+                )
+            )
+
+        if transform_type == "map":
+            if "mappings" not in transform:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code="MISSING_MAP_MAPPINGS",
+                        message=f"Map transform for {prop_name} missing 'mappings' array",
+                        file_path=file_path,
+                        component_path=f"{component_path}.propConfig.{prop_name}.transforms[{index}]",
+                        component_type=comp_type,
+                        suggestion="Add 'mappings' array with input/output pairs",
+                    )
+                )
+
+            # Check for fallback value on map transforms
+            if "fallback" not in transform:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.INFO,
+                        code="MISSING_MAP_FALLBACK",
+                        message=f"Map transform for {prop_name} should include fallback value",
+                        file_path=file_path,
+                        component_path=f"{component_path}.propConfig.{prop_name}.transforms[{index}]",
+                        component_type=comp_type,
+                        suggestion="Add 'fallback' property for unmapped values",
+                    )
+                )
+
+    def _validate_jython_script(
+        self,
+        script_content: str,
+        prop_name: str,
+        context: str,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Validate inline Jython scripts using the shared validator."""
+        if not script_content or not script_content.strip():
+            return
+
+        validator_issues = self.jython_validator.validate_script(
+            script_content, context=context
+        )
+        for issue in validator_issues:
+            issue.file_path = file_path
+            issue.component_path = f"{component_path}.{prop_name}"
+            issue.component_type = comp_type
+            self.issues.append(issue)
+
+    def _validate_event_scripts(
+        self, component: dict, file_path: str, component_path: str
+    ):
+        """Validate Jython scripts in event handlers."""
+        events = component.get("events", {})
+        comp_type = component.get("type", "unknown")
+
+        for event_category, handlers in events.items():
+            if isinstance(handlers, dict):
+                for event_name, handler_config in handlers.items():
+                    # Handle both single handler and array of handlers
+                    handlers_list = (
+                        handler_config
+                        if isinstance(handler_config, list)
+                        else [handler_config]
+                    )
+
+                    for j, handler in enumerate(handlers_list):
+                        if (
+                            isinstance(handler, dict)
+                            and handler.get("type") == "script"
+                        ):
+                            script_code = handler.get("config", {}).get("script", "")
+                            if script_code:
+                                context = f"event.{event_category}.{event_name}[{j}]"
+                                prop_name = f"events.{event_category}.{event_name}"
+                                self._validate_jython_script(
+                                    script_code,
+                                    prop_name,
+                                    context,
+                                    file_path,
+                                    component_path,
+                                    comp_type,
+                                )
+
+    def _validate_expressions(
+        self, component: dict, file_path: str, component_path: str
+    ):
+        """Validate expression bindings and expression transforms in a component."""
+        prop_config = component.get("propConfig", {})
+        comp_type = component.get("type", "unknown")
+
+        for prop_name, config in prop_config.items():
+            if not isinstance(config, dict):
+                continue
+
+            binding = config.get("binding")
+            if not isinstance(binding, dict):
+                continue
+
+            binding_type = binding.get("type")
+            binding_config = binding.get("config", {})
+
+            # expr bindings
+            if binding_type == "expr" and isinstance(binding_config, dict):
+                expression = binding_config.get("expression", "")
+                if expression:
+                    self.issues.extend(
+                        self.expression_validator.validate_expression(
+                            expression,
+                            f"expr({prop_name})",
+                            file_path,
+                            f"{component_path}.propConfig.{prop_name}",
+                            comp_type,
+                        )
+                    )
+
+            # expr-struct bindings - each member has its own expression
+            if binding_type == "expr-struct" and isinstance(binding_config, dict):
+                struct = binding_config.get("struct", {})
+                if isinstance(struct, dict):
+                    for member_name, member_expr in struct.items():
+                        if isinstance(member_expr, str) and member_expr.strip():
+                            self.issues.extend(
+                                self.expression_validator.validate_expression(
+                                    member_expr,
+                                    f"expr-struct({prop_name}.{member_name})",
+                                    file_path,
+                                    f"{component_path}.propConfig.{prop_name}.{member_name}",
+                                    comp_type,
+                                )
+                            )
+
+            # Expression transforms
+            transforms = binding.get("transforms", [])
+            for i, transform in enumerate(transforms):
+                if (
+                    isinstance(transform, dict)
+                    and transform.get("type") == "expression"
+                ):
+                    expr_text = transform.get("expression", "")
+                    if expr_text:
+                        self.issues.extend(
+                            self.expression_validator.validate_expression(
+                                expr_text,
+                                f"transform[{i}]({prop_name})",
+                                file_path,
+                                f"{component_path}.propConfig.{prop_name}.transforms[{i}]",
+                                comp_type,
+                            )
+                        )
+
+    def _validate_propconfig_expressions(
+        self, prop_config: dict, file_path: str, context_prefix: str
+    ):
+        """Validate expression bindings in a propConfig dict (for view-level usage)."""
+        for prop_name, config in prop_config.items():
+            if not isinstance(config, dict):
+                continue
+
+            binding = config.get("binding")
+            if not isinstance(binding, dict):
+                continue
+
+            binding_type = binding.get("type")
+            binding_config = binding.get("config", {})
+
+            if binding_type == "expr" and isinstance(binding_config, dict):
+                expression = binding_config.get("expression", "")
+                if expression:
+                    self.issues.extend(
+                        self.expression_validator.validate_expression(
+                            expression,
+                            f"view.expr({prop_name})",
+                            file_path,
+                            f"{context_prefix}.propConfig.{prop_name}",
+                            "view",
+                        )
+                    )
+
+            if binding_type == "expr-struct" and isinstance(binding_config, dict):
+                struct = binding_config.get("struct", {})
+                if isinstance(struct, dict):
+                    for member_name, member_expr in struct.items():
+                        if isinstance(member_expr, str) and member_expr.strip():
+                            self.issues.extend(
+                                self.expression_validator.validate_expression(
+                                    member_expr,
+                                    f"view.expr-struct({prop_name}.{member_name})",
+                                    file_path,
+                                    f"{context_prefix}.propConfig.{prop_name}.{member_name}",
+                                    "view",
+                                )
+                            )
+
+            transforms = binding.get("transforms", [])
+            for i, transform in enumerate(transforms):
+                if (
+                    isinstance(transform, dict)
+                    and transform.get("type") == "expression"
+                ):
+                    expr_text = transform.get("expression", "")
+                    if expr_text:
+                        self.issues.extend(
+                            self.expression_validator.validate_expression(
+                                expr_text,
+                                f"view.transform[{i}]({prop_name})",
+                                file_path,
+                                f"{context_prefix}.propConfig.{prop_name}.transforms[{i}]",
+                                "view",
+                            )
+                        )
+
+    def _validate_onchange_scripts(
+        self, component: dict, file_path: str, component_path: str
+    ):
+        """Validate onChange scripts within a component's propConfig."""
+        prop_config = component.get("propConfig", {})
+        comp_type = component.get("type", "unknown")
+
+        for prop_name, config in prop_config.items():
+            on_change = config.get("onChange") if isinstance(config, dict) else None
+            if not isinstance(on_change, dict):
+                continue
+            script_code = on_change.get("script", "")
+            if script_code:
+                context = f"onChange({prop_name})"
+                self._validate_jython_script(
+                    script_code,
+                    f"propConfig.{prop_name}.onChange",
+                    context,
+                    file_path,
+                    component_path,
+                    comp_type,
+                )
+
+    def _validate_propconfig_scripts(
+        self, prop_config: dict, file_path: str, context_prefix: str
+    ):
+        """Validate onChange and transform scripts in a propConfig dict (view-level or component-level)."""
+        for prop_name, config in prop_config.items():
+            if not isinstance(config, dict):
+                continue
+
+            # onChange scripts
+            on_change = config.get("onChange")
+            if isinstance(on_change, dict):
+                script_code = on_change.get("script", "")
+                if script_code:
+                    context = f"{context_prefix}.onChange({prop_name})"
+                    self._validate_jython_script(
+                        script_code,
+                        f"propConfig.{prop_name}.onChange",
+                        context,
+                        file_path,
+                        context_prefix,
+                        "view",
+                    )
+
+            # Transform scripts on bindings
+            binding = config.get("binding")
+            if isinstance(binding, dict):
+                transforms = binding.get("transforms", [])
+                for i, transform in enumerate(transforms):
+                    if (
+                        isinstance(transform, dict)
+                        and transform.get("type") == "script"
+                    ):
+                        script_code = transform.get("code", "")
+                        if script_code:
+                            context = f"{context_prefix}.binding.transform[{i}]"
+                            self._validate_jython_script(
+                                script_code,
+                                f"propConfig.{prop_name}.binding.transforms[{i}]",
+                                context,
+                                file_path,
+                                context_prefix,
+                                "view",
+                            )
+
+    @staticmethod
+    def _collect_all_strings(obj: Any) -> list[str]:
+        """Recursively collect all string values from a JSON structure."""
+        strings: list[str] = []
+        if isinstance(obj, str):
+            strings.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                strings.extend(IgnitionPerspectiveLinter._collect_all_strings(v))
+        elif isinstance(obj, list):
+            for item in obj:
+                strings.extend(IgnitionPerspectiveLinter._collect_all_strings(item))
+        return strings
+
+    @staticmethod
+    def _collect_propconfig_keys(obj: Any, prefix: str = "") -> set[str]:
+        """Recursively collect all propConfig key paths from a JSON structure."""
+        keys: set[str] = set()
+        if isinstance(obj, dict):
+            prop_config = obj.get("propConfig", {})
+            if isinstance(prop_config, dict):
+                for k in prop_config:
+                    keys.add(k)
+            for v in obj.values():
+                keys.update(IgnitionPerspectiveLinter._collect_propconfig_keys(v))
+        elif isinstance(obj, list):
+            for item in obj:
+                keys.update(IgnitionPerspectiveLinter._collect_propconfig_keys(item))
+        return keys
+
+    def _check_unused_properties(self, view_data: dict, file_path: str):
+        """Check for custom and param properties that appear unreferenced within the view."""
+        custom_props = view_data.get("custom", {})
+        params_props = view_data.get("params", {})
+
+        if not custom_props and not params_props:
+            return
+
+        # Collect all strings and propConfig keys from the entire view
+        all_strings = self._collect_all_strings(view_data)
+        all_text = "\n".join(all_strings)
+        propconfig_keys = self._collect_propconfig_keys(view_data)
+
+        # Check custom properties
+        if isinstance(custom_props, dict):
+            for prop_name in custom_props:
+                # Search for references in expressions, scripts, and propConfig keys
+                expr_ref = f"view.custom.{prop_name}"
+                script_ref = f"self.view.custom.{prop_name}"
+                binding_target = f"custom.{prop_name}"
+
+                found = (
+                    expr_ref in all_text
+                    or script_ref in all_text
+                    or binding_target in propconfig_keys
+                )
+                if not found:
+                    self.issues.append(
+                        LintIssue(
+                            severity=LintSeverity.WARNING,
+                            code="UNUSED_CUSTOM_PROPERTY",
+                            message=f"Custom property '{prop_name}' appears unreferenced in this view",
+                            file_path=file_path,
+                            component_path=f"custom.{prop_name}",
+                            component_type="view",
+                            suggestion="Remove if unused, or verify it's referenced by an embedding view",
+                        )
+                    )
+
+        # Check param properties
+        if isinstance(params_props, dict):
+            for prop_name in params_props:
+                expr_ref = f"view.params.{prop_name}"
+                script_ref = f"self.view.params.{prop_name}"
+                binding_target = f"params.{prop_name}"
+
+                found = (
+                    expr_ref in all_text
+                    or script_ref in all_text
+                    or binding_target in propconfig_keys
+                )
+                if not found:
+                    self.issues.append(
+                        LintIssue(
+                            severity=LintSeverity.INFO,
+                            code="UNUSED_PARAM_PROPERTY",
+                            message=f"Param property '{prop_name}' appears unreferenced in this view",
+                            file_path=file_path,
+                            component_path=f"params.{prop_name}",
+                            component_type="view",
+                            suggestion="Params may be set by embedding views; verify before removing",
+                        )
+                    )
+
+    # --- Tier 2 & 3: Binding path resolution (view-level pass) ---
+
+    _PROPERTY_BOUNDARY_RE = re.compile(r"\.(props|custom|position|meta)\.")
+
+    @staticmethod
+    def _build_component_name_tree(node: dict) -> dict:
+        """Build a nested dict from the component tree keyed by meta.name.
+
+        Returns a dict like:
+        {"Header": {"_type": "ia.container.flex", "_children": {"Label": {...}}}, ...}
+        """
+        tree: dict = {}
+        for child in node.get("children", []):
+            name = child.get("meta", {}).get("name", "")
+            if not name:
+                continue
+            entry: dict = {
+                "_type": child.get("type", "unknown"),
+                "_children": IgnitionPerspectiveLinter._build_component_name_tree(
+                    child
+                ),
+            }
+            tree[name] = entry
+        return tree
+
+    def _resolve_component_path(
+        self,
+        path: str,
+        name_tree: dict,
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Verify that an absolute component path resolves in the name tree.
+
+        path: the portion after /root/, e.g. "Header/Label.props.text"
+        """
+        # Find where the component path ends and property access begins
+        boundary = self._PROPERTY_BOUNDARY_RE.search(path)
+        if boundary:
+            component_part = path[: boundary.start()]
+        else:
+            # No property boundary — entire path is component segments
+            component_part = path
+
+        segments = [s for s in component_part.split("/") if s]
+        current = name_tree
+        for i, segment in enumerate(segments):
+            if segment not in current:
+                available = sorted(current.keys())
+                trail = "/root/" + "/".join(segments[: i + 1])
+                available_str = (
+                    f" Available children: {', '.join(available)}"
+                    if available
+                    else " No children at this level"
+                )
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code="BINDING_COMPONENT_NOT_FOUND",
+                        message=f"Component path '{trail}' — '{segment}' not found",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion=f"Check component name spelling.{available_str}",
+                    )
+                )
+                return
+            current = current[segment].get("_children", {})
+
+    def _validate_binding_paths(self, view_data: dict, file_path: str):
+        """View-level pass: resolve view property refs and component paths in bindings."""
+        custom_keys = set()
+        params_keys = set()
+        custom = view_data.get("custom", {})
+        params = view_data.get("params", {})
+        if isinstance(custom, dict):
+            custom_keys = set(custom.keys())
+        if isinstance(params, dict):
+            params_keys = set(params.keys())
+
+        name_tree = self._build_component_name_tree(view_data.get("root", {}))
+
+        # Walk the entire view collecting property binding paths and expression refs
+        self._walk_bindings_for_resolution(
+            view_data, file_path, custom_keys, params_keys, name_tree
+        )
+
+    @staticmethod
+    def _extract_top_level_key(dotted_suffix: str) -> str | None:
+        """Extract the top-level key from a dotted path, stripping array indices.
+
+        'alarm.name' -> 'alarm'
+        'items[0].x' -> 'items'
+        """
+        if not dotted_suffix:
+            return None
+        first = dotted_suffix.split(".")[0]
+        # Strip array index: items[0] -> items
+        bracket = first.find("[")
+        if bracket != -1:
+            first = first[:bracket]
+        return first if first else None
+
+    def _walk_bindings_for_resolution(
+        self,
+        obj: Any,
+        file_path: str,
+        custom_keys: set[str],
+        params_keys: set[str],
+        name_tree: dict,
+        path_prefix: str = "root",
+    ):
+        """Recursively walk view data to find bindings and expression refs for resolution."""
+        if isinstance(obj, dict):
+            prop_config = obj.get("propConfig", {})
+            comp_type = obj.get("type", "view")
+
+            if isinstance(prop_config, dict):
+                for prop_name, config in prop_config.items():
+                    if not isinstance(config, dict):
+                        continue
+                    binding = config.get("binding")
+                    if not isinstance(binding, dict):
+                        continue
+
+                    binding_type = binding.get("type")
+                    binding_config = binding.get("config", {})
+                    component_path = f"{path_prefix}.propConfig.{prop_name}"
+
+                    # Tier 2: Resolve view.custom.X / view.params.X in property bindings
+                    if binding_type == "property" and isinstance(binding_config, dict):
+                        bp = binding_config.get("path", "")
+                        if isinstance(bp, str):
+                            self._check_view_prop_ref(
+                                bp,
+                                custom_keys,
+                                params_keys,
+                                file_path,
+                                component_path,
+                                comp_type,
+                                code="BINDING_VIEW_PROP_NOT_FOUND",
+                            )
+
+                    # Tier 3: Resolve /root/A/B component paths in property bindings
+                    if binding_type == "property" and isinstance(binding_config, dict):
+                        bp = binding_config.get("path", "")
+                        if isinstance(bp, str) and bp.startswith("/root/"):
+                            after_root = bp[len("/root/") :]
+                            self._resolve_component_path(
+                                after_root,
+                                name_tree,
+                                file_path,
+                                component_path,
+                                comp_type,
+                            )
+
+                    # Tier 2: Check expression refs {view.custom.X} / {view.params.X}
+                    if binding_type == "expr" and isinstance(binding_config, dict):
+                        expr = binding_config.get("expression", "")
+                        if isinstance(expr, str):
+                            self._check_expr_view_refs(
+                                expr,
+                                custom_keys,
+                                params_keys,
+                                file_path,
+                                component_path,
+                                comp_type,
+                            )
+                    if binding_type == "expr-struct" and isinstance(
+                        binding_config, dict
+                    ):
+                        struct = binding_config.get("struct", {})
+                        if isinstance(struct, dict):
+                            for member_name, member_expr in struct.items():
+                                if isinstance(member_expr, str):
+                                    self._check_expr_view_refs(
+                                        member_expr,
+                                        custom_keys,
+                                        params_keys,
+                                        file_path,
+                                        f"{component_path}.{member_name}",
+                                        comp_type,
+                                    )
+
+                    # Also check expression transforms
+                    transforms = binding.get("transforms", [])
+                    if isinstance(transforms, list):
+                        for i, transform in enumerate(transforms):
+                            if (
+                                isinstance(transform, dict)
+                                and transform.get("type") == "expression"
+                            ):
+                                expr = transform.get("expression", "")
+                                if isinstance(expr, str):
+                                    self._check_expr_view_refs(
+                                        expr,
+                                        custom_keys,
+                                        params_keys,
+                                        file_path,
+                                        f"{component_path}.transforms[{i}]",
+                                        comp_type,
+                                    )
+
+            # Recurse into children
+            children = obj.get("children", [])
+            if isinstance(children, list):
+                for i, child in enumerate(children):
+                    child_name = (
+                        child.get("meta", {}).get("name", f"[{i}]")
+                        if isinstance(child, dict)
+                        else f"[{i}]"
+                    )
+                    self._walk_bindings_for_resolution(
+                        child,
+                        file_path,
+                        custom_keys,
+                        params_keys,
+                        name_tree,
+                        f"{path_prefix}/{child_name}",
+                    )
+
+            # Recurse into root (for top-level view_data)
+            if "root" in obj and path_prefix == "root":
+                self._walk_bindings_for_resolution(
+                    obj["root"],
+                    file_path,
+                    custom_keys,
+                    params_keys,
+                    name_tree,
+                    "root",
+                )
+
+    def _check_view_prop_ref(
+        self,
+        path: str,
+        custom_keys: set[str],
+        params_keys: set[str],
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+        code: str,
+    ):
+        """Check if a view.custom.X or view.params.X reference resolves."""
+        if path.startswith("view.custom."):
+            suffix = path[len("view.custom.") :]
+            top_key = self._extract_top_level_key(suffix)
+            if top_key and top_key not in custom_keys:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code=code,
+                        message=f"Property '{path}' references view.custom.{top_key} which is not defined",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion=f"Add '{top_key}' to the view's custom properties or fix the path",
+                    )
+                )
+        elif path.startswith("view.params."):
+            suffix = path[len("view.params.") :]
+            top_key = self._extract_top_level_key(suffix)
+            if top_key and top_key not in params_keys:
+                self.issues.append(
+                    LintIssue(
+                        severity=LintSeverity.WARNING,
+                        code=code,
+                        message=f"Property '{path}' references view.params.{top_key} which is not defined",
+                        file_path=file_path,
+                        component_path=component_path,
+                        component_type=comp_type,
+                        suggestion=f"Add '{top_key}' to the view's params or fix the path",
+                    )
+                )
+
+    _EXPR_VIEW_REF_RE = re.compile(r"\{(view\.(?:custom|params)\.[^}]+)\}")
+
+    def _check_expr_view_refs(
+        self,
+        expression: str,
+        custom_keys: set[str],
+        params_keys: set[str],
+        file_path: str,
+        component_path: str,
+        comp_type: str,
+    ):
+        """Check {view.custom.X} and {view.params.X} refs in an expression."""
+        for m in self._EXPR_VIEW_REF_RE.finditer(expression):
+            ref = m.group(1)
+            self._check_view_prop_ref(
+                ref,
+                custom_keys,
+                params_keys,
+                file_path,
+                component_path,
+                comp_type,
+                code="EXPR_VIEW_PROP_NOT_FOUND",
+            )
+
+    @staticmethod
+    def _build_component_line_map(raw_text: str) -> dict[str, int]:
+        """Map component names and types to 1-based line numbers in the raw JSON text.
+
+        Creates a mapping for quick line number lookups during issue enrichment.
+        Prioritizes component names (meta.name) and falls back to types.
+        """
+        line_map: dict[str, int] = {}
+        name_pattern = re.compile(r'"name"\s*:\s*"([^"]*)"')
+        type_pattern = re.compile(r'"type"\s*:\s*"(ia\.[^"]*)"')
+
+        for lineno, line in enumerate(raw_text.splitlines(), start=1):
+            # Map component names (meta.name)
+            m = name_pattern.search(line)
+            if m:
+                component_name = m.group(1)
+                # Store only the first occurrence of each name
+                if component_name and component_name not in line_map:
+                    line_map[component_name] = lineno
+
+            # Also map component types for fallback
+            m = type_pattern.search(line)
+            if m:
+                comp_type = m.group(1)
+                # Use a prefixed key to avoid collision with names
+                type_key = f"__type__{comp_type}__{lineno}"
+                line_map[type_key] = lineno
+
+        return line_map
+
+    def _enrich_issue_line_numbers(
+        self,
+        issues: list[LintIssue],
+        line_map: dict[str, int],
+        start_idx: int,
+        raw_text: str = "",
+    ) -> None:
+        """Fill in line_number for issues that lack one.
+
+        Uses multiple strategies to locate the correct line:
+        1. metadata.search_key - direct text search near component
+        2. metadata.component_name - lookup in line_map
+        3. component_type - fallback to any instance of that type
+        """
+        raw_lines = raw_text.splitlines() if raw_text else []
+
+        for issue in issues[start_idx:]:
+            if issue.line_number is not None:
+                continue
+
+            search_key = issue.metadata.get("search_key")
+            component_name = issue.metadata.get("component_name")
+
+            # Strategy 1: Direct text search using search_key
+            if search_key and raw_lines:
+                start_line = 0
+                # If we know the component name, start searching from its line
+                if component_name and component_name in line_map:
+                    start_line = line_map[component_name] - 1  # 0-indexed
+
+                for i, line in enumerate(raw_lines[start_line:], start_line + 1):
+                    if search_key in line:
+                        issue.line_number = i
+                        break
+
+                if issue.line_number is not None:
+                    continue
+
+            # Strategy 2: Component name lookup
+            if component_name and component_name in line_map:
+                issue.line_number = line_map[component_name]
+                continue
+
+            # Strategy 3: Component type fallback
+            if issue.component_type:
+                for key, lineno in line_map.items():
+                    if key.startswith(f"__type__{issue.component_type}__"):
+                        issue.line_number = lineno
+                        break
+
+    def lint_file(
+        self, file_path: str, target_component_type: str | None = None
+    ) -> bool:
+        """Lint a single view.json file."""
+        # Track starting index for issues so we only enrich new ones
+        issues_start_idx = len(self.issues)
+
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                raw_text = f.read()
+            view_data = json.loads(raw_text)
+        except json.JSONDecodeError as e:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="INVALID_JSON",
+                    message=f"Invalid JSON format: {e}",
+                    file_path=file_path,
+                    component_path="file",
+                    component_type="view",
+                    suggestion=f"Line {e.lineno}: {e.msg}",
+                )
+            )
+            return False
+        except Exception as e:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.ERROR,
+                    code="FILE_READ_ERROR",
+                    message=f"Could not read file: {e}",
+                    file_path=file_path,
+                    component_path="file",
+                    component_type="view",
+                )
+            )
+            return False
+
+        # Validate view-level propConfig (onChange scripts, transform scripts, expressions)
+        view_prop_config = view_data.get("propConfig", {})
+        if isinstance(view_prop_config, dict):
+            for prop_name in view_prop_config:
+                if not prop_name.startswith(self._VALID_BINDING_SCOPES):
+                    self.issues.append(
+                        LintIssue(
+                            severity=LintSeverity.ERROR,
+                            code="BINDING_NON_BINDABLE_PROPERTY",
+                            message=f"propConfig targets non-bindable structural property '{prop_name}'",
+                            file_path=file_path,
+                            component_path=f"view.propConfig.{prop_name}",
+                            component_type="view",
+                            suggestion=(
+                                f"'{prop_name}' is a structural key with no binding scope. "
+                                "Only props.*, position.*, custom.*, meta.*, and params.* "
+                                "are bindable. This will cause an IllegalArgumentException "
+                                "in Ignition Designer."
+                            ),
+                        )
+                    )
+            self._validate_propconfig_scripts(view_prop_config, file_path, "view")
+            self._validate_propconfig_expressions(view_prop_config, file_path, "view")
+
+        # Extract components
+        components = self.extract_components_with_context(view_data, file_path)
+
+        if not components:
+            self.issues.append(
+                LintIssue(
+                    severity=LintSeverity.INFO,
+                    code="NO_COMPONENTS",
+                    message="No ia.* components found in view",
+                    file_path=file_path,
+                    component_path="root",
+                    component_type="view",
+                )
+            )
+            return True
+
+        # Filter by component type if specified
+        if target_component_type:
+            components = [
+                (comp, fp, path)
+                for comp, fp, path in components
+                if comp.get("type", "").startswith(target_component_type)
+            ]
+
+        file_valid = True
+        for component, _, component_path in components:
+            comp_type = component.get("type", "unknown")
+            self.component_stats["component_types"].add(comp_type)
+            self.component_stats["total_components"] += 1
+
+            # Schema validation
+            is_valid = self.validate_component_schema(
+                component, file_path, component_path
+            )
+            if is_valid:
+                self.component_stats["valid_components"] += 1
+            else:
+                self.component_stats["invalid_components"] += 1
+                file_valid = False
+
+            # Best practices checks
+            self.check_component_best_practices(component, file_path, component_path)
+
+            # Accessibility checks
+            self.check_component_accessibility(component, file_path, component_path)
+
+        # Check for unused custom/param properties (per-view)
+        self._check_unused_properties(view_data, file_path)
+
+        # Validate binding paths against view structure (Tier 2 & 3)
+        self._validate_binding_paths(view_data, file_path)
+
+        # Enrich line numbers for all issues generated during this lint
+        line_map = self._build_component_line_map(raw_text)
+        self._enrich_issue_line_numbers(
+            self.issues, line_map, issues_start_idx, raw_text
+        )
+
+        return file_valid
+
+    def lint_project(
+        self, target_path: str, target_component_type: str | None = None
+    ) -> dict[str, Any]:
+        """Lint an entire Ignition project."""
+        print("🔍 Ignition Perspective Linter", file=sys.stderr)
+        print(f"Target: {target_path}", file=sys.stderr)
+        if target_component_type:
+            print(f"Component Filter: {target_component_type}", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+        if not self.jsonschema_available:
+            print(
+                "⚠️  jsonschema dependency not available; skipping schema validation checks.",
+                file=sys.stderr,
+            )
+
+        view_files = self.find_view_files(target_path)
+
+        if not view_files:
+            print("❌ No view.json files found in target directory", file=sys.stderr)
+            return {"success": False, "message": "No view files found"}
+
+        print(f"📁 Found {len(view_files)} view files", file=sys.stderr)
+
+        self.component_stats["total_files"] = len(view_files)
+        valid_files = 0
+
+        for i, file_path in enumerate(view_files, 1):
+            if i % 50 == 0:
+                print(f"   Processing file {i}/{len(view_files)}...", file=sys.stderr)
+
+            file_valid = self.lint_file(file_path, target_component_type)
+            if file_valid:
+                valid_files += 1
+
+        return {
+            "success": True,
+            "total_files": len(view_files),
+            "valid_files": valid_files,
+            "total_issues": len(self.issues),
+            "component_stats": self.component_stats,
+        }
+
+    def generate_report(self, verbose: bool = False) -> str:
+        """Generate a comprehensive linting report."""
+        report = []
+        report.append("\n" + "=" * 60)
+        report.append("📊 LINTING REPORT")
+        report.append("=" * 60)
+
+        # Summary statistics
+        stats = self.component_stats
+        report.append(f"📁 Files processed: {stats['total_files']}")
+        report.append(f"🧩 Components analyzed: {stats['total_components']}")
+        report.append(f"✅ Valid components: {stats['valid_components']}")
+        report.append(f"❌ Invalid components: {stats['invalid_components']}")
+        report.append(f"🔧 Component types found: {len(stats['component_types'])}")
+
+        if stats["total_components"] > 0:
+            success_rate = (stats["valid_components"] / stats["total_components"]) * 100
+            report.append(f"📈 Schema compliance: {success_rate:.1f}%")
+
+        # Issue summary by severity
+        severity_counts = {}
+        for issue in self.issues:
+            severity_counts[issue.severity] = severity_counts.get(issue.severity, 0) + 1
+
+        report.append("\n📋 Issues by severity:")
+        for severity in LintSeverity:
+            count = severity_counts.get(severity, 0)
+            if count > 0:
+                icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️", "style": "💄"}[
+                    severity.value
+                ]
+                report.append(f"   {icon} {severity.value}: {count}")
+
+        # Issues by component type
+        component_issues = {}
+        for issue in self.issues:
+            comp_type = issue.component_type
+            if comp_type not in component_issues:
+                component_issues[comp_type] = []
+            component_issues[comp_type].append(issue)
+
+        if component_issues:
+            report.append("\n🎯 Issues by component type:")
+            for comp_type, issues in sorted(component_issues.items()):
+                report.append(f"   {comp_type}: {len(issues)} issues")
+
+        # Most common component types
+        if stats["component_types"]:
+            report.append("\n🏗️ Component types discovered:")
+            for comp_type in sorted(stats["component_types"]):
+                report.append(f"   - {comp_type}")
+
+        # Detailed issues (if verbose or critical errors)
+        critical_issues = [i for i in self.issues if i.severity == LintSeverity.ERROR]
+        if verbose or critical_issues:
+            report.append("\n🔍 DETAILED ISSUES")
+            report.append("-" * 60)
+
+            issues_to_show = self.issues if verbose else critical_issues
+
+            # Group issues by file for better readability
+            issues_by_file = {}
+            for issue in issues_to_show:
+                if issue.file_path not in issues_by_file:
+                    issues_by_file[issue.file_path] = []
+                issues_by_file[issue.file_path].append(issue)
+
+            for file_path, file_issues in issues_by_file.items():
+                # Show relative path for readability
+                rel_path = (
+                    os.path.relpath(file_path) if len(file_path) > 80 else file_path
+                )
+                report.append(f"\n📄 {rel_path}")
+
+                for issue in file_issues:
+                    severity_icon = {
+                        "error": "❌",
+                        "warning": "⚠️",
+                        "info": "ℹ️",
+                        "style": "💄",
+                    }[issue.severity.value]
+
+                    report.append(f"   {severity_icon} {issue.code}: {issue.message}")
+                    report.append(
+                        f"      Component: {issue.component_type} at {issue.component_path}"
+                    )
+                    if issue.suggestion:
+                        report.append(f"      Suggestion: {issue.suggestion}")
+                    report.append("")
+
+        return "\n".join(report)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lint Ignition Perspective view.json files for schema compliance and best practices"
+    )
+    parser.add_argument(
+        "--target",
+        "-t",
+        required=True,
+        help="Path to Ignition project directory or specific view file",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show detailed output with all issues",
+    )
+    parser.add_argument(
+        "--component-type",
+        "-c",
+        help="Filter linting to specific component type (e.g., 'ia.display.label')",
+    )
+    parser.add_argument(
+        "--schema",
+        default=None,
+        help="Path to component schema file (default: schemas/core-ia-components-schema-robust.json)",
+    )
+    parser.add_argument(
+        "--output", "-o", help="Output report to file instead of stdout"
+    )
+
+    args = parser.parse_args()
+
+    # Initialize linter
+    linter = IgnitionPerspectiveLinter(args.schema)
+
+    # Run linting
+    result = linter.lint_project(args.target, args.component_type)
+
+    if not result["success"]:
+        print(f"❌ Linting failed: {result['message']}", file=sys.stderr)
+        sys.exit(1)
+
+    # Generate report
+    report = linter.generate_report(args.verbose)
+
+    # Output report
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(report)
+        print(f"📝 Report saved to: {args.output}", file=sys.stderr)
+    else:
+        print(report)
+
+    # Exit with appropriate code
+    critical_issues = len(
+        [i for i in linter.issues if i.severity == LintSeverity.ERROR]
+    )
+    if critical_issues > 0:
+        print(
+            f"\n❌ Linting completed with {critical_issues} critical errors",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        print("\n✅ Linting completed successfully", file=sys.stderr)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

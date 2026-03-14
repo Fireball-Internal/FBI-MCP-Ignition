@@ -1,0 +1,339 @@
+# Ignition Lint - project .gitignore
+
+# === Python ===
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# hatch-vcs generated version file
+src/ignition_lint/_version.py
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff
+instance/
+.webassets-cache
+
+# Scrapy stuff
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#pdm.lock
+#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
+#   in version control.
+#   https://pdm.fming.dev/#use-with-ide
+.pdm.toml
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# UV package manager
+.uv/
+
+# === IDE & Editor Files ===
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.swp
+*.swo
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Temporary files
+*.tmp
+*.temp
+
+# === System Files ===
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# === Linting & Analysis Results ===
+# Linting output files (keep samples but ignore bulk results)
+*linting_results*.json
+*linting_results*.txt
+*linting_results*.xml
+corrected_linting_results.json
+ignition_script_linting_results.json
+
+# Analysis temporary files
+debug_*.py
+test_*.py
+temp_*.py
+
+# Local action test scripts
+test_action_direct.py
+test_action_simple.sh
+test-action-local.sh
+
+# === Logs ===
+*.log
+logs/
+*.log.*
+
+# === Backup Files ===
+*.bak
+*.backup
+*.orig
+*.save
+*~
+
+# === Temporary Directories ===
+tmp/
+temp/
+
+# === Project Specific ===
+# Ignition project files that shouldn't be committed
+# (keeping schema and documentation files)
+
+# Large data files
+*.csv.large
+*.json.large
+data/large/
+
+# Personal notes and scratch files
+NOTES.md
+SCRATCH.md
+TODO.personal.md
+*.personal.*
+
+# Environment specific configs
+.env.local
+.env.development
+.env.test
+.env.production
+
+# === Dependencies ===
+# Node modules (if any JS tooling is added)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# === Archives ===
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# === Claude Code ===
+# Local settings contain user-specific paths; use .claude/settings.template.json as reference
+.claude/settings.local.json
+
+# === Security ===
+# API keys, tokens, secrets
+.secrets
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+.env.secret
+
+# === Documentation Build ===
+docs/build/
+
+# === Keep Important Files ===
+# Explicitly keep important project files
+!core-ia-components-schema-robust.json
+!ignition-perspective-linter.py
+!ignition-script-linter.py
+!*.md
+!pyproject.toml
+!requirements.txt
+!README.md
+
+# Keep sample linting results for reference
+!linting_results.json.sample
+!ENHANCED_LINTING_RESULTS_REPORT.md
+!CORRECTED_LINTING_RESULTS_REPORT.md
+!IGNITION_SCRIPT_LINTING_REPORT.md
+
+!tests/test_*.py

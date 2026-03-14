@@ -1,0 +1,16 @@
+{
+  "name": "caldera-mcp",
+  "owner": {
+    "name": "jaedync"
+  },
+  "metadata": {
+    "description": "Domain skills for Ignition SCADA development via Caldera MCP"
+  },
+  "plugins": [
+    {
+      "name": "caldera-mcp",
+      "source": "./plugins/caldera-mcp",
+      "description": "5 workflow-based skills for Ignition SCADA development: gateway exploration, Perspective view debugging, Jython scripting, feature planning, and safe write operations. Connects to your Caldera MCP server for 71+ tools."
+    }
+  ]
+}

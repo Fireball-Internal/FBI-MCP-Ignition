@@ -1,0 +1,139 @@
+"""Common reporting utilities for Ignition linting."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .suppression import SuppressionConfig
+
+
+class LintSeverity(str, Enum):
+    """Supported issue severities."""
+
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+    STYLE = "style"
+
+    @classmethod
+    def ordered_levels(cls) -> list[LintSeverity]:
+        """Severity levels from most to least critical."""
+        return [cls.ERROR, cls.WARNING, cls.INFO, cls.STYLE]
+
+    @classmethod
+    def from_string(cls, value: str) -> LintSeverity:
+        normalized = value.strip().lower()
+        for level in cls:
+            if level.value == normalized:
+                return level
+        raise ValueError(f"Unknown severity level: {value}")
+
+    def fails_threshold(self, threshold: LintSeverity) -> bool:
+        """Return True if this severity should fail given threshold."""
+        order = self.ordered_levels()
+        return order.index(self) <= order.index(threshold)
+
+
+@dataclass
+class LintIssue:
+    """Normalized lint issue structure."""
+
+    severity: LintSeverity
+    code: str
+    message: str
+    file_path: str
+    component_path: str | None = None
+    component_type: str | None = None
+    line_number: int | None = None
+    column: int | None = None
+    suggestion: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class LintReport:
+    """Aggregate linting results used across modules."""
+
+    issues: list[LintIssue] = field(default_factory=list)
+    summary: dict[str, int] = field(default_factory=dict)
+    suppression: SuppressionConfig | None = None
+    suppressed_count: int = 0
+
+    def add_issue(self, issue: LintIssue) -> None:
+        if self.suppression and self.suppression.should_suppress(
+            issue.code, issue.file_path
+        ):
+            self.suppressed_count += 1
+            return
+        self.issues.append(issue)
+        self.summary[issue.severity.value] = (
+            self.summary.get(issue.severity.value, 0) + 1
+        )
+
+    def extend(self, issues: Iterable[LintIssue]) -> None:
+        for issue in issues:
+            self.add_issue(issue)
+
+    def has_failures(self, threshold: LintSeverity) -> bool:
+        return any(issue.severity.fails_threshold(threshold) for issue in self.issues)
+
+    def merge(self, other: LintReport) -> None:
+        self.extend(other.issues)
+
+
+def format_report_text(report: LintReport) -> str:
+    """Pretty-print a lint report."""
+    lines: list[str] = []
+    lines.append("=" * 60)
+    lines.append("📊 LINT RESULTS")
+    lines.append("=" * 60)
+
+    if not report.issues:
+        lines.append("✅ No issues found")
+        if report.suppressed_count:
+            lines.append(f"🔇 {report.suppressed_count} issues suppressed")
+        return "\n".join(lines)
+
+    severity_order = LintSeverity.ordered_levels()
+    lines.append("📋 Issues by severity:")
+    for level in severity_order:
+        count = report.summary.get(level.value, 0)
+        if count:
+            icon = {
+                LintSeverity.ERROR: "❌",
+                LintSeverity.WARNING: "⚠️",
+                LintSeverity.INFO: "ℹ️",
+                LintSeverity.STYLE: "💡",
+            }[level]
+            lines.append(f"  {icon} {level.value.title()}: {count}")
+
+    lines.append("")
+    for issue in report.issues:
+        icon = {
+            LintSeverity.ERROR: "❌",
+            LintSeverity.WARNING: "⚠️",
+            LintSeverity.INFO: "ℹ️",
+            LintSeverity.STYLE: "💡",
+        }[issue.severity]
+        location = issue.component_path or ""
+        line_info = f":{issue.line_number}" if issue.line_number else ""
+        lines.append(f"{icon} [{issue.code}] {issue.message}")
+        lines.append(f"   File: {issue.file_path}{line_info}")
+        if location:
+            lines.append(f"   Component: {location}")
+        if issue.suggestion:
+            lines.append(f"   Suggestion: {issue.suggestion}")
+        if issue.metadata:
+            for key, value in issue.metadata.items():
+                lines.append(f"   {key}: {value}")
+        lines.append("")
+
+    if report.suppressed_count:
+        lines.append(f"🔇 {report.suppressed_count} issues suppressed")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
