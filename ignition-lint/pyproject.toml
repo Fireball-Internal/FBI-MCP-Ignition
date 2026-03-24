@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "ignition-lint-toolkit"
-dynamic = ["version"]
+version = "0.3.0"
 description = "Comprehensive Ignition linting tool with naming conventions and empirical validation. Extends ia-eknorr/ignition-lint with enhanced features."
 readme = "README.md"
 license = "MIT"
@@ -48,14 +48,7 @@ ignition-lint-server = "ignition_lint.server:main"
 ignition-lint = "ignition_lint.cli:main"
 ignition-lint-action = "ignition_lint.action_entry:main"
 
-[tool.hatch.version]
-source = "vcs"
 
-[tool.hatch.version.raw-options]
-local_scheme = "no-local-version"
-
-[tool.hatch.build.hooks.vcs]
-version-file = "src/ignition_lint/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ignition_lint"]

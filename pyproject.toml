@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fbi-ignition-mcp"
+version = "0.1.0"
+description = "Unified MCP server for Ignition SCADA — combines Caldera execution tools, ignition-lint validation, and Perspective component schemas."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Fireball Industries LLC" },
+]
+requires-python = ">=3.10"
+keywords = ["ignition", "mcp", "scada", "lint", "caldera", "perspective"]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "jsonschema>=4.25.1",
+    "pathspec>=0.11.0",
+    "ignition-lint-toolkit",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.1.0",
+    "respx>=0.21.0",
+]
+
+[project.scripts]
+fbi-ignition-mcp = "fbi_ignition_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fbi_ignition_mcp"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+ignition-lint-toolkit = { path = "ignition-lint", editable = true }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
