@@ -397,7 +397,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fbi-ignition-mcp"
+name = "fbi-mcp-ignition"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

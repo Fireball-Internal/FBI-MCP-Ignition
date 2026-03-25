@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 import jsonschema
-
 from ignition_lint.schemas import schema_path_for
 
 

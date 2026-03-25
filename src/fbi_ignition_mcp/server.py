@@ -15,18 +15,24 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from .caldera_proxy import CalderaProxy
-from .schema_tools import get_component_types, validate_component_json
-
 # ---------------------------------------------------------------------------
 # Import ignition-lint tools
 # ---------------------------------------------------------------------------
 from ignition_lint.server import (
     check_linter_status as _il_check_linter_status,
+)
+from ignition_lint.server import (
     lint_ignition_project as _il_lint_ignition_project,
+)
+from ignition_lint.server import (
     lint_jython_scripts as _il_lint_jython_scripts,
+)
+from ignition_lint.server import (
     lint_perspective_components as _il_lint_perspective_components,
 )
+
+from .caldera_proxy import CalderaProxy
+from .schema_tools import get_component_types, validate_component_json
 
 # ---------------------------------------------------------------------------
 # Reference docs path (Caldera plugin reference material)
@@ -43,7 +49,7 @@ _REFERENCE_DIR = (
 # Server instance
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
-    "FBI Ignition",
+    "FBI MCP Ignition",
     instructions=(
         "Unified MCP server for Ignition SCADA development. "
         "Provides linting/validation tools (offline) and Caldera gateway "

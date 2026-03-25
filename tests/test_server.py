@@ -12,7 +12,7 @@ def test_server_imports():
     from fbi_ignition_mcp import server  # noqa: F401
 
     assert server.mcp is not None
-    assert server.mcp.name == "FBI Ignition"
+    assert server.mcp.name == "FBI MCP Ignition"
 
 
 def test_validate_component_json_valid():
