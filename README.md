@@ -1,4 +1,4 @@
-# FBI Ignition MCP Server
+# FBI MCP Ignition
 
 Unified MCP server for Ignition SCADA development — combines Caldera execution tools, ignition-lint validation, and Perspective component schemas.
 
@@ -6,7 +6,7 @@ Unified MCP server for Ignition SCADA development — combines Caldera execution
 
 ```bash
 uv sync --extra dev
-uv run fbi-ignition-mcp
+uv run fbi-mcp-ignition
 ```
 
 ## Environment Variables

@@ -25,7 +25,7 @@ If you built the extension from source or were provided a `.vsix` file:
 2. Go to the Extensions view (`Ctrl+Shift+X` or `Cmd+Shift+X`).
 3. Click the `...` (More Actions) menu in the top right of the Extensions view.
 4. Select **Install from VSIX...**
-5. Locate the downloaded `.vsix` file (e.g., in `c:\codebase\fbi-ignition-mcp\ignition-lint\`) and install it.
+5. Locate the downloaded `.vsix` file (e.g., in `c:\codebase\FBI-MCP-Ignition\ignition-lint\`) and install it.
 
 ## Usage & Configuration
 

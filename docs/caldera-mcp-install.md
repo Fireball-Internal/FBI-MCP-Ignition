@@ -11,7 +11,7 @@ This guide describes how to install and setup the Caldera MCP Plugin for connect
 
 1. **Navigate to the Caldera MCP Plugin directory:**
    ```bash
-   cd c:\codebase\fbi-ignition-mcp\caldera-mcp-plugin
+   cd c:\codebase\FBI-MCP-Ignition\caldera-mcp-plugin
    ```
 
 2. **Install dependencies:**
@@ -38,7 +38,7 @@ Add the following to your configuration file, ensuring you replace the `args` wi
     "caldera-ignition": {
       "command": "node",
       "args": [
-        "C:\\codebase\\fbi-ignition-mcp\\caldera-mcp-plugin\\build\\index.js"
+        "C:\\codebase\\FBI-MCP-Ignition\\caldera-mcp-plugin\\build\\index.js"
       ],
       "env": {
         "IGNITION_URL": "http://localhost:8088",
